@@ -21,7 +21,7 @@
 use crate::message_classification::{
     counts_as_turn, is_first_prompt_candidate, is_system_content_for_preview,
 };
-use crate::session::{Session, SessionSource};
+use crate::session::{Session, SessionAgent, SessionSource, SessionStorage};
 use anyhow::{Context, Result};
 use memchr::memmem;
 use rayon::prelude::*;
@@ -158,7 +158,7 @@ pub fn find_sessions_with_source(
     let sessions: Vec<Session> = jsonl_files
         .into_par_iter()
         .with_max_len(1)
-        .filter_map(|filepath| extract_session_metadata(filepath, &source))
+        .filter_map(|filepath| parse_session_file(filepath, &source, SessionStorage::Live))
         .collect();
 
     Ok(sessions)
@@ -193,7 +193,11 @@ fn is_valid_session_file(path: &Path) -> bool {
 }
 
 /// Extract all session metadata from a .jsonl file in a single pass.
-fn extract_session_metadata(filepath: PathBuf, source: &SessionSource) -> Option<Session> {
+pub fn parse_session_file(
+    filepath: PathBuf,
+    source: &SessionSource,
+    storage: SessionStorage,
+) -> Option<Session> {
     let id = filepath.file_stem()?.to_string_lossy().into_owned();
 
     let metadata = fs::metadata(&filepath).ok()?;
@@ -221,6 +225,7 @@ fn extract_session_metadata(filepath: PathBuf, source: &SessionSource) -> Option
 
     Some(Session {
         id,
+        agent: SessionAgent::Claude,
         project,
         project_path: scan.project_path,
         filepath,
@@ -232,6 +237,7 @@ fn extract_session_metadata(filepath: PathBuf, source: &SessionSource) -> Option
         tag: scan.tag,
         turn_count: scan.turn_count,
         source: source.clone(),
+        storage,
         forked_from: scan.forked_from,
     })
 }
@@ -374,18 +380,8 @@ fn scan_session_file(filepath: &Path) -> SessionScan {
 /// Lowercase transcript text keyed by session ID, for Ctrl+S filtering.
 pub type SearchIndex = std::collections::HashMap<String, String>;
 
-/// Build the transcript search index for the given sessions in parallel.
-/// Intended to run on a background thread after the picker has rendered.
-pub fn build_search_index(targets: Vec<(String, PathBuf)>) -> SearchIndex {
-    targets
-        .into_par_iter()
-        .with_max_len(1)
-        .map(|(id, path)| (id, scan_search_text(&path)))
-        .collect()
-}
-
 /// Extract lowercase transcript text from a single session file.
-fn scan_search_text(filepath: &Path) -> String {
+pub fn scan_search_text(filepath: &Path) -> String {
     let Ok(file) = File::open(filepath) else {
         return String::new();
     };
