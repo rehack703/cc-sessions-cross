@@ -1,6 +1,48 @@
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+/// Which assistant CLI produced a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAgent {
+    Claude,
+    Codex,
+}
+
+impl SessionAgent {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            SessionAgent::Claude => "claude",
+            SessionAgent::Codex => "codex",
+        }
+    }
+
+    pub fn storage_dir(self) -> &'static str {
+        self.display_name()
+    }
+}
+
+/// Where the transcript file currently lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStorage {
+    Live,
+    Archive,
+    Trash,
+}
+
+impl SessionStorage {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            SessionStorage::Live => "live",
+            SessionStorage::Archive => "archive",
+            SessionStorage::Trash => "trash",
+        }
+    }
+
+    pub fn is_live(self) -> bool {
+        matches!(self, SessionStorage::Live)
+    }
+}
+
 /// Where a session originated from.
 #[derive(Debug, Clone)]
 pub enum SessionSource {
@@ -32,9 +74,10 @@ impl SessionSource {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Session {
     pub id: String,
+    pub agent: SessionAgent,
     pub project: String,
     pub project_path: String,
     pub filepath: PathBuf,
@@ -46,5 +89,6 @@ pub struct Session {
     pub tag: Option<String>,     // searchable label from /tag
     pub turn_count: usize,       // Number of user messages (conversation turns)
     pub source: SessionSource,   // Where this session came from
+    pub storage: SessionStorage, // Live transcript, archived copy, or trash
     pub forked_from: Option<String>, // Parent session ID if this is a fork
 }

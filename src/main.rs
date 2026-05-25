@@ -1,4 +1,6 @@
+mod archive;
 mod claude_code;
+mod codex;
 mod interactive_state;
 mod message_classification;
 mod metadata;
@@ -6,9 +8,9 @@ mod remote;
 mod session;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use interactive_state::{Action as StateAction, Effect as StateEffect, InteractiveState};
-use session::{Session, SessionSource};
+use session::{Session, SessionAgent, SessionSource, SessionStorage};
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -20,7 +22,7 @@ use std::time::SystemTime;
 #[derive(Parser)]
 #[command(
     name = "cc-sessions",
-    about = "List and resume Claude Code sessions across projects and machines"
+    about = "List and resume Claude Code and Codex sessions across projects and machines"
 )]
 struct Args {
     // -------------------------------------------------------------------------
@@ -44,6 +46,18 @@ struct Args {
     /// Show session ID prefixes and extra stats
     #[arg(long, help_heading = "Mode")]
     debug: bool,
+
+    /// Which agent's sessions to show
+    #[arg(long, value_enum, default_value = "all", help_heading = "Mode")]
+    agent: AgentFilter,
+
+    /// Browse archived sessions instead of live sessions
+    #[arg(long, conflicts_with = "trash", help_heading = "Mode")]
+    archive: bool,
+
+    /// Browse trashed sessions instead of live sessions
+    #[arg(long, conflicts_with = "archive", help_heading = "Mode")]
+    trash: bool,
 
     // -------------------------------------------------------------------------
     // List-only
@@ -71,6 +85,10 @@ struct Args {
     #[arg(long, value_name = "STATUS", help_heading = "Filtering")]
     status: Option<String>,
 
+    /// Include sessions marked done in the default live view
+    #[arg(long, help_heading = "Filtering")]
+    include_done: bool,
+
     // -------------------------------------------------------------------------
     // Remote sync
     // -------------------------------------------------------------------------
@@ -96,6 +114,31 @@ struct Args {
     /// Preview a session file (used internally by interactive picker)
     #[arg(long, value_name = "FILE", hide = true)]
     preview: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AgentFilter {
+    All,
+    Claude,
+    Codex,
+}
+
+impl AgentFilter {
+    fn includes(self, agent: SessionAgent) -> bool {
+        match self {
+            AgentFilter::All => true,
+            AgentFilter::Claude => agent == SessionAgent::Claude,
+            AgentFilter::Codex => agent == SessionAgent::Codex,
+        }
+    }
+
+    fn as_agent(self) -> Option<SessionAgent> {
+        match self {
+            AgentFilter::All => None,
+            AgentFilter::Claude => Some(SessionAgent::Claude),
+            AgentFilter::Codex => Some(SessionAgent::Codex),
+        }
+    }
 }
 
 // =============================================================================
@@ -164,16 +207,43 @@ fn main() -> Result<()> {
         sync_failures = summary.failure_count();
     }
 
-    // Find sessions from all sources (local + remotes)
-    let discovery = claude_code::find_all_sessions_with_summary(&config, args.remote.as_deref())?;
-    for failure in &discovery.failures {
-        eprintln!(
-            "Warning: Failed to load sessions from '{}': {}",
-            failure.source_name, failure.reason
-        );
-    }
-    enforce_strict_mode(args.strict, sync_failures, discovery.failure_count())?;
-    let mut sessions = discovery.sessions;
+    let storage_view = if args.archive {
+        SessionStorage::Archive
+    } else if args.trash {
+        SessionStorage::Trash
+    } else {
+        SessionStorage::Live
+    };
+
+    let mut discovery_failures = 0;
+    let mut sessions = if storage_view.is_live() {
+        // Find sessions from all live sources.
+        let mut sessions = Vec::new();
+
+        if args.agent.includes(SessionAgent::Claude) {
+            let discovery =
+                claude_code::find_all_sessions_with_summary(&config, args.remote.as_deref())?;
+            for failure in &discovery.failures {
+                eprintln!(
+                    "Warning: Failed to load sessions from '{}': {}",
+                    failure.source_name, failure.reason
+                );
+            }
+            discovery_failures += discovery.failure_count();
+            sessions.extend(discovery.sessions);
+        }
+
+        if args.agent.includes(SessionAgent::Codex) && args.remote.is_none() {
+            sessions.extend(codex::find_sessions()?);
+        }
+
+        sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+        sessions
+    } else {
+        archive::find_sessions(storage_view, args.agent.as_agent())?
+    };
+
+    enforce_strict_mode(args.strict, sync_failures, discovery_failures)?;
 
     // Filter by project name if specified
     if let Some(ref filter) = args.project {
@@ -200,6 +270,10 @@ fn main() -> Result<()> {
                 _ => true,
             }
         });
+    } else if !args.include_done && storage_view.is_live() {
+        let meta_store = metadata::load();
+        sessions
+            .retain(|s| metadata::get_status(&meta_store, &s.id) != Some(metadata::Status::Done));
     }
 
     if sessions.is_empty() {
@@ -209,14 +283,14 @@ fn main() -> Result<()> {
         if let Some(ref remote_name) = args.remote {
             anyhow::bail!("No sessions found for remote '{}'", remote_name);
         }
-        anyhow::bail!("No sessions found");
+        anyhow::bail!("No {} sessions found", storage_view.display_name());
     }
 
     if args.list {
         let list_sessions = filter_forks_for_list(&sessions, args.include_forks);
         print_sessions(&list_sessions, args.count, args.debug);
     } else {
-        interactive_mode(&sessions, args.fork, args.debug)?;
+        interactive_mode(sessions, args.fork, args.debug)?;
     }
 
     Ok(())
@@ -254,14 +328,15 @@ fn print_sessions(sessions: &[&Session], count: usize, debug: bool) {
 
     if debug {
         println!(
-            "{:<6} {:<6} {:<2} {:<4} {:<8} {:<16} {:<40} SUMMARY",
-            "CREAT", "MOD", "ST", "FORK", "SOURCE", "PROJECT", "ID"
+            "{:<6} {:<6} {:<2} {:<4} {:<6} {:<8} {:<16} {:<40} SUMMARY",
+            "CREAT", "MOD", "ST", "FORK", "AGENT", "SOURCE", "PROJECT", "ID"
         );
-        println!("{}", "─".repeat(135));
+        println!("{}", "─".repeat(142));
 
         for session in sessions.iter().take(count) {
             let created = format_time_relative(session.created);
             let modified = format_time_relative(session.modified);
+            let agent = session.agent.display_name();
             let source = session.source.display_name();
             let st = metadata::get_status(&meta_store, &session.id)
                 .map(|s| s.indicator())
@@ -284,23 +359,24 @@ fn print_sessions(sessions: &[&Session], count: usize, debug: bool) {
             };
 
             println!(
-                "{:<6} {:<6} {:<2} {:<4} {:<8} {:<16} {:<40} {}",
-                created, modified, st, fork_indicator, source, session.project, id_short, desc
+                "{:<6} {:<6} {:<2} {:<4} {:<6} {:<8} {:<16} {:<40} {}",
+                created, modified, st, fork_indicator, agent, source, session.project, id_short, desc
             );
         }
 
-        println!("{}", "─".repeat(135));
+        println!("{}", "─".repeat(142));
         println!("Total: {} sessions", sessions.len());
     } else {
         println!(
-            "{:<6} {:<6} {:<2} {:<8} {:<16} SUMMARY",
-            "CREAT", "MOD", "ST", "SOURCE", "PROJECT"
+            "{:<6} {:<6} {:<2} {:<6} {:<8} {:<16} SUMMARY",
+            "CREAT", "MOD", "ST", "AGENT", "SOURCE", "PROJECT"
         );
-        println!("{}", "─".repeat(105));
+        println!("{}", "─".repeat(112));
 
         for session in sessions.iter().take(count) {
             let created = format_time_relative(session.created);
             let modified = format_time_relative(session.modified);
+            let agent = session.agent.display_name();
             let source = session.source.display_name();
             let st = metadata::get_status(&meta_store, &session.id)
                 .map(|s| s.indicator())
@@ -318,14 +394,14 @@ fn print_sessions(sessions: &[&Session], count: usize, debug: bool) {
             };
 
             println!(
-                "{:<6} {:<6} {:<2} {:<8} {:<16} {}",
-                created, modified, st, source, session.project, desc
+                "{:<6} {:<6} {:<2} {:<6} {:<8} {:<16} {}",
+                created, modified, st, agent, source, session.project, desc
             );
         }
 
-        println!("{}", "─".repeat(105));
+        println!("{}", "─".repeat(112));
         println!("Run without --list for interactive picker; use --fork to fork when resuming");
-        println!("Filter by status: --status active|paused|done");
+        println!("Filter by agent/status: --agent claude|codex|all --status active|paused|done");
     }
 }
 
@@ -451,9 +527,52 @@ mod colors {
 /// Print formatted transcript preview for a session file.
 /// Used internally by skim's preview command.
 fn print_session_preview(filepath: &PathBuf) -> Result<()> {
-    let content = generate_preview_content(filepath)?;
+    let content = if looks_like_codex_path(filepath) {
+        codex::generate_preview_content(filepath)?
+    } else {
+        generate_preview_content(filepath)?
+    };
     print!("{}", content);
     Ok(())
+}
+
+fn looks_like_codex_path(path: &std::path::Path) -> bool {
+    path.components()
+        .any(|c| c.as_os_str().to_string_lossy() == ".codex")
+        || path
+            .components()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|w| w[0].as_os_str().to_string_lossy() == "codex")
+}
+
+fn generate_preview_for_session(session: &Session) -> Result<String> {
+    match session.agent {
+        SessionAgent::Claude => generate_preview_content(&session.filepath),
+        SessionAgent::Codex => codex::generate_preview_content(&session.filepath),
+    }
+}
+
+fn generate_search_preview_for_session(session: &Session, pattern: &str) -> Result<String> {
+    match session.agent {
+        SessionAgent::Claude => generate_search_preview(&session.filepath, pattern),
+        SessionAgent::Codex => codex::generate_search_preview(&session.filepath, pattern),
+    }
+}
+
+fn build_search_index_for_sessions(
+    targets: Vec<(String, SessionAgent, PathBuf)>,
+) -> claude_code::SearchIndex {
+    targets
+        .into_iter()
+        .map(|(id, agent, path)| {
+            let text = match agent {
+                SessionAgent::Claude => claude_code::scan_search_text(&path),
+                SessionAgent::Codex => codex::scan_search_text(&path),
+            };
+            (id, text)
+        })
+        .collect()
 }
 
 /// Extract first text block from a message entry, borrowing from the JSON value
@@ -797,6 +916,14 @@ fn shell_escape(s: &str) -> String {
 fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> Result<()> {
     use std::process::Command;
 
+    if !session.storage.is_live() {
+        anyhow::bail!(
+            "Cannot resume {} session from {}; restore it first",
+            session.agent.display_name(),
+            session.storage.display_name()
+        );
+    }
+
     let action = if fork { "Forking" } else { "Resuming" };
     let project_path = &session.project_path;
 
@@ -807,8 +934,35 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
         anyhow::bail!("Cannot resume: no project path");
     }
 
-    let status = match &session.source {
-        SessionSource::Local => {
+    let status = match (session.agent, &session.source) {
+        (SessionAgent::Codex, SessionSource::Local) => {
+            if !std::path::Path::new(project_path).exists() {
+                eprintln!(
+                    "Error: Project directory no longer exists: {}",
+                    project_path
+                );
+                eprintln!("Session file: {}", filepath.display());
+                anyhow::bail!("Cannot resume: directory '{}' not found", project_path);
+            }
+
+            println!(
+                "{} Codex session {} in {}",
+                action, session.id, session.project_path
+            );
+
+            let mut cmd = Command::new("codex");
+            cmd.current_dir(project_path);
+            if fork {
+                cmd.args(["fork", &session.id]);
+            } else {
+                cmd.args(["resume", &session.id]);
+            }
+            cmd.status()?
+        }
+        (SessionAgent::Codex, SessionSource::Remote { .. }) => {
+            anyhow::bail!("Remote Codex sessions are not supported yet")
+        }
+        (SessionAgent::Claude, SessionSource::Local) => {
             // Verify directory exists locally
             if !std::path::Path::new(project_path).exists() {
                 eprintln!(
@@ -840,7 +994,7 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
             }
             cmd.status()?
         }
-        SessionSource::Remote { name, host, user } => {
+        (SessionAgent::Claude, SessionSource::Remote { name, host, user }) => {
             let ssh_target = match user {
                 Some(u) => format!("{}@{}", u, host),
                 None => host.clone(),
@@ -912,9 +1066,9 @@ fn build_subtree_header(
         ("esc to clear", String::new())
     } else {
         let hint = if focus.is_some() {
-            "← back │ tab:status │ t:sort"
+            "← back │ tab:status │ a:archive │ x:trash │ t:sort"
         } else {
-            "→ forks │ tab:status │ t:sort"
+            "→ forks │ tab:status │ a:archive │ x:trash │ t:sort"
         };
         let info = focus
             .and_then(|id| session_by_id.get(id))
@@ -944,8 +1098,9 @@ fn build_subtree_header(
 }
 
 /// Width (in columns) consumed by the fixed fields before SUMMARY:
-/// prefix (2) + CRE (4+1) + MOD (4+1) + MSG (3+1) + SOURCE (6+1) + PROJECT (12+1).
-const FIXED_COLS: usize = 36;
+/// status (1) + prefix (2) + CRE (4+1) + MOD (4+1) + MSG (3+1)
+/// + AGENT (6+1) + SOURCE (6+1) + PROJECT (12+1).
+const FIXED_COLS: usize = 44;
 
 /// Simple session row format (no tree glyphs). `desc_width` is the budget for
 /// the trailing summary column — caller computes it from the available pane
@@ -958,6 +1113,7 @@ fn format_session_row_simple(
 ) -> String {
     let created = format_time_relative(session.created);
     let modified = format_time_relative(session.modified);
+    let agent = session.agent.display_name();
     let source = session.source.display_name();
     let id_prefix = if debug {
         format!("{:<6}", &session.id[..5.min(session.id.len())])
@@ -974,8 +1130,8 @@ fn format_session_row_simple(
     let desc = format_session_desc(session, desc_width);
 
     format!(
-        "{}{}{:<4} {:<4} {} {:<6} {:<12} {}",
-        prefix, id_prefix, created, modified, msgs, source, project, desc,
+        "{}{}{:<4} {:<4} {} {:<6} {:<6} {:<12} {}",
+        prefix, id_prefix, created, modified, msgs, agent, source, project, desc,
     )
 }
 
@@ -1006,7 +1162,7 @@ fn desc_budget(pane_width: u16, debug: bool) -> usize {
 /// Build column legend for interactive mode
 fn build_column_legend(debug: bool) -> String {
     let id_col = if debug { "ID    " } else { "" };
-    format!("  {}CRE  MOD  MSG SOURCE PROJECT      SUMMARY", id_col)
+    format!("  {}CRE  MOD  MSG AGENT  SOURCE PROJECT      SUMMARY", id_col)
 }
 
 /// Compute visible sessions based on current search and subtree focus state.
@@ -1122,7 +1278,7 @@ fn parse_ansi_text(input: &str) -> ratatui::text::Text<'static> {
 // Interactive Mode (ratatui + crossterm TUI)
 // =============================================================================
 
-fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()> {
+fn interactive_mode(mut sessions: Vec<Session>, fork: bool, debug: bool) -> Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
     use ratatui::backend::CrosstermBackend;
@@ -1134,18 +1290,12 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
     use std::collections::HashMap;
     use std::io;
 
-    let session_by_id: HashMap<&str, &Session> =
-        sessions.iter().map(|s| (s.id.as_str(), s)).collect();
-    let children_map = build_fork_tree(sessions);
-
     // Background search index
-    let index_targets: Vec<(String, PathBuf)> = sessions
+    let index_targets: Vec<(String, SessionAgent, PathBuf)> = sessions
         .iter()
-        .map(|s| (s.id.clone(), s.filepath.clone()))
+        .map(|s| (s.id.clone(), s.agent, s.filepath.clone()))
         .collect();
-    let mut index_handle = Some(std::thread::spawn(move || {
-        claude_code::build_search_index(index_targets)
-    }));
+    let mut index_handle = Some(std::thread::spawn(move || build_search_index_for_sessions(index_targets)));
     let mut search_index: Option<claude_code::SearchIndex> = None;
 
     let mut state = InteractiveState::default();
@@ -1173,9 +1323,20 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
     let mut meta_store = metadata::load();
 
     'outer: loop {
+        if sessions.is_empty() {
+            selected_session_id = None;
+            break 'outer;
+        }
+
+        let session_by_id: HashMap<&str, &Session> =
+            sessions.iter().map(|s| (s.id.as_str(), s)).collect();
+        let children_map = build_fork_tree(&sessions);
+        let has_children_ids: std::collections::HashSet<String> =
+            children_map.keys().map(|id| (*id).to_owned()).collect();
+
         let focus = state.focus().map(String::as_str);
         let mut visible = visible_sessions_for_view(
-            sessions,
+            &sessions,
             &session_by_id,
             &children_map,
             state.search_results(),
@@ -1215,7 +1376,7 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
         let desc_width = desc_budget(term_size.width / 2, debug);
 
         // Build display rows: (row_text, session_id, is_named)
-        let display_items: Vec<(String, &str, bool)> = visible
+        let display_items: Vec<(String, String, bool)> = visible
             .iter()
             .map(|session| {
                 let prefix = if focus == Some(session.id.as_str()) {
@@ -1230,7 +1391,7 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
                     .unwrap_or(" ");
                 (
                     format!("{}{}", st, format_session_row_simple(prefix, session, debug, desc_width)),
-                    session.id.as_str(),
+                    session.id.clone(),
                     session.name.is_some(),
                 )
             })
@@ -1259,11 +1420,11 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
         // Generate preview for selected session
         let preview_content = filtered
             .get(selected)
-            .and_then(|&idx| session_by_id.get(display_items[idx].1))
+            .and_then(|&idx| sessions.iter().find(|s| s.id == display_items[idx].1))
             .and_then(|session| {
                 match state.search_pattern() {
-                    Some(pat) => generate_search_preview(&session.filepath, pat),
-                    None => generate_preview_content(&session.filepath),
+                    Some(pat) => generate_search_preview_for_session(session, pat),
+                    None => generate_preview_for_session(session),
                 }
                 .ok()
             })
@@ -1351,6 +1512,10 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
             f.render_widget(preview, h_split[1]);
         })?;
 
+        drop(visible);
+        drop(children_map);
+        drop(session_by_id);
+
         // Handle input
         if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
@@ -1369,7 +1534,7 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
                     },
                     (KeyCode::Enter, _) => {
                         if let Some(&idx) = filtered.get(selected) {
-                            let id = display_items[idx].1.to_string();
+                            let id = display_items[idx].1.clone();
                             if let StateEffect::Select { session_id } =
                                 state.apply(StateAction::Enter {
                                     selected_id: Some(id),
@@ -1394,8 +1559,8 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
                     }
                     (KeyCode::Right, _) => {
                         if let Some(&idx) = filtered.get(selected) {
-                            let id = display_items[idx].1.to_string();
-                            let has_children = children_map.contains_key(id.as_str());
+                            let id = display_items[idx].1.clone();
+                            let has_children = has_children_ids.contains(id.as_str());
                             let _ = state.apply(StateAction::Right {
                                 selected_id: Some(id),
                                 has_children,
@@ -1443,9 +1608,73 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
                     (KeyCode::Tab, _) => {
                         // Cycle status: none → active → paused → done → none
                         if let Some(&idx) = filtered.get(selected) {
-                            let id = display_items[idx].1;
+                            let id = display_items[idx].1.as_str();
                             metadata::cycle_status(&mut meta_store, id);
                             let _ = metadata::save(&meta_store);
+                        }
+                    }
+                    (KeyCode::Char('d'), m)
+                        if !m.contains(KeyModifiers::CONTROL) && filter_text.is_empty() =>
+                    {
+                        if let Some(&idx) = filtered.get(selected) {
+                            let id = display_items[idx].1.as_str();
+                            metadata::set_status(&mut meta_store, id, Some(metadata::Status::Done));
+                            let _ = metadata::save(&meta_store);
+                            sessions.retain(|s| s.id != id);
+                            state = InteractiveState::default();
+                            selected = selected.saturating_sub(1);
+                            preview_scroll = 0;
+                        }
+                    }
+                    (KeyCode::Char('a'), m)
+                        if !m.contains(KeyModifiers::CONTROL) && filter_text.is_empty() =>
+                    {
+                        let selected_session = filtered
+                            .get(selected)
+                            .and_then(|&idx| sessions.iter().find(|s| s.id == display_items[idx].1))
+                            .cloned();
+                        if let Some(session) = selected_session
+                            && session.storage.is_live()
+                            && archive::archive_session(&session).is_ok()
+                        {
+                            sessions.retain(|s| s.id != session.id);
+                            state = InteractiveState::default();
+                            selected = selected.saturating_sub(1);
+                            preview_scroll = 0;
+                        }
+                    }
+                    (KeyCode::Char('x'), m)
+                        if !m.contains(KeyModifiers::CONTROL) && filter_text.is_empty() =>
+                    {
+                        let selected_session = filtered
+                            .get(selected)
+                            .and_then(|&idx| sessions.iter().find(|s| s.id == display_items[idx].1))
+                            .cloned();
+                        if let Some(session) = selected_session
+                            && session.storage.is_live()
+                            && archive::trash_session(&session).is_ok()
+                        {
+                            sessions.retain(|s| s.id != session.id);
+                            state = InteractiveState::default();
+                            selected = selected.saturating_sub(1);
+                            preview_scroll = 0;
+                        }
+                    }
+                    (KeyCode::Char('r'), m)
+                        if !m.contains(KeyModifiers::CONTROL) && filter_text.is_empty() =>
+                    {
+                        let selected_session = filtered
+                            .get(selected)
+                            .and_then(|&idx| sessions.iter().find(|s| s.id == display_items[idx].1))
+                            .cloned();
+                        if let Some(session) = selected_session
+                            && !session.storage.is_live()
+                            && archive::restore_session(&session).is_ok()
+                        {
+                            sessions.retain(|s| s.id != session.id);
+                            state = InteractiveState::default();
+                            selected = selected.saturating_sub(1);
+                            preview_scroll = 0;
                         }
                     }
                     (KeyCode::Char('t'), m) if !m.contains(KeyModifiers::CONTROL) && filter_text.is_empty() => {
@@ -1482,7 +1711,7 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
 
     // Resume selected session
     if let Some(session_id) = selected_session_id
-        && let Some(session) = session_by_id.get(session_id.as_str())
+        && let Some(session) = sessions.iter().find(|s| s.id == session_id)
     {
         resume_session(session, &session.filepath, fork)?;
     }
@@ -1625,6 +1854,7 @@ mod tests {
     fn test_session(id: &str) -> Session {
         Session {
             id: id.to_string(),
+            agent: SessionAgent::Claude,
             project: "test-project".to_string(),
             project_path: "/tmp/test-project".to_string(),
             filepath: PathBuf::from(format!("/tmp/{}.jsonl", id)),
@@ -1636,6 +1866,7 @@ mod tests {
             tag: None,
             turn_count: 1,
             source: SessionSource::Local,
+            storage: SessionStorage::Live,
             forked_from: None,
         }
     }
@@ -1698,7 +1929,7 @@ mod tests {
     #[test]
     fn build_column_legend_without_debug() {
         let legend = build_column_legend(false);
-        assert_eq!(legend, "  CRE  MOD  MSG SOURCE PROJECT      SUMMARY");
+        assert_eq!(legend, "  CRE  MOD  MSG AGENT  SOURCE PROJECT      SUMMARY");
         assert!(!legend.contains("ID"));
     }
 
@@ -1801,10 +2032,10 @@ mod tests {
 
     #[test]
     fn desc_budget_scales_with_pane_width() {
-        // 200-col pane → 200 − 36 fixed = 164
-        assert_eq!(desc_budget(200, false), 164);
+        // 200-col pane -> 200 - 44 fixed = 156
+        assert_eq!(desc_budget(200, false), 156);
         // Debug adds 6 for the ID prefix
-        assert_eq!(desc_budget(200, true), 158);
+        assert_eq!(desc_budget(200, true), 150);
         // Narrow pane floors at 20
         assert_eq!(desc_budget(40, false), 20);
     }
