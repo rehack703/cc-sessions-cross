@@ -957,6 +957,8 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
             } else {
                 cmd.args(["resume", &session.id]);
             }
+            // Mirror Claude's bypassPermissions: open Codex in yolo mode.
+            cmd.arg("--dangerously-bypass-approvals-and-sandbox");
             cmd.status()?
         }
         (SessionAgent::Codex, SessionSource::Remote { .. }) => {
