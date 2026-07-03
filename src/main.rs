@@ -1,9 +1,11 @@
 mod archive;
 mod claude_code;
 mod codex;
+mod hermes;
 mod interactive_state;
 mod message_classification;
 mod metadata;
+mod pi;
 mod profile;
 mod remote;
 mod session;
@@ -26,7 +28,7 @@ const CODEX_YOLO_ARG: &str = "--yolo";
 #[derive(Parser)]
 #[command(
     name = "cc-sessions",
-    about = "List and resume Claude Code and Codex sessions across projects and machines"
+    about = "List and resume Claude Code, Codex, Pi, and Hermes sessions across projects and machines"
 )]
 struct Args {
     // -------------------------------------------------------------------------
@@ -140,6 +142,8 @@ enum AgentFilter {
     All,
     Claude,
     Codex,
+    Pi,
+    Hermes,
 }
 
 impl AgentFilter {
@@ -148,6 +152,8 @@ impl AgentFilter {
             AgentFilter::All => true,
             AgentFilter::Claude => agent == SessionAgent::Claude,
             AgentFilter::Codex => agent == SessionAgent::Codex,
+            AgentFilter::Pi => agent == SessionAgent::Pi,
+            AgentFilter::Hermes => agent == SessionAgent::Hermes,
         }
     }
 
@@ -156,6 +162,8 @@ impl AgentFilter {
             AgentFilter::All => None,
             AgentFilter::Claude => Some(SessionAgent::Claude),
             AgentFilter::Codex => Some(SessionAgent::Codex),
+            AgentFilter::Pi => Some(SessionAgent::Pi),
+            AgentFilter::Hermes => Some(SessionAgent::Hermes),
         }
     }
 }
@@ -267,6 +275,14 @@ fn main() -> Result<()> {
 
             if args.agent.includes(SessionAgent::Codex) && args.remote.is_none() {
                 sessions.extend(codex::find_sessions()?);
+            }
+
+            if args.agent.includes(SessionAgent::Pi) && args.remote.is_none() {
+                sessions.extend(pi::find_sessions()?);
+            }
+
+            if args.agent.includes(SessionAgent::Hermes) && args.remote.is_none() {
+                sessions.extend(hermes::find_sessions()?);
             }
 
             sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
@@ -562,7 +578,9 @@ mod colors {
 /// Print formatted transcript preview for a session file.
 /// Used internally by skim's preview command.
 fn print_session_preview(filepath: &PathBuf) -> Result<()> {
-    let content = if looks_like_codex_path(filepath) {
+    let content = if looks_like_pi_path(filepath) {
+        pi::generate_preview_content(filepath)?
+    } else if looks_like_codex_path(filepath) {
         codex::generate_preview_content(filepath)?
     } else {
         generate_preview_content(filepath)?
@@ -581,10 +599,17 @@ fn looks_like_codex_path(path: &std::path::Path) -> bool {
             .any(|w| w[0].as_os_str().to_string_lossy() == "codex")
 }
 
+fn looks_like_pi_path(path: &std::path::Path) -> bool {
+    path.components()
+        .any(|c| c.as_os_str().to_string_lossy() == ".pi")
+}
+
 fn generate_preview_for_session(session: &Session) -> Result<String> {
     match session.agent {
         SessionAgent::Claude => generate_preview_content(&session.filepath),
         SessionAgent::Codex => codex::generate_preview_content(&session.filepath),
+        SessionAgent::Pi => pi::generate_preview_content(&session.filepath),
+        SessionAgent::Hermes => hermes::generate_preview_for_session_id(&session.id),
     }
 }
 
@@ -592,6 +617,8 @@ fn generate_search_preview_for_session(session: &Session, pattern: &str) -> Resu
     match session.agent {
         SessionAgent::Claude => generate_search_preview(&session.filepath, pattern),
         SessionAgent::Codex => codex::generate_search_preview(&session.filepath, pattern),
+        SessionAgent::Pi => pi::generate_search_preview(&session.filepath, pattern),
+        SessionAgent::Hermes => hermes::generate_search_preview(&session.id, pattern),
     }
 }
 
@@ -604,6 +631,8 @@ fn build_search_index_for_sessions(
             let text = match agent {
                 SessionAgent::Claude => claude_code::scan_search_text(&path),
                 SessionAgent::Codex => codex::scan_search_text(&path),
+                SessionAgent::Pi => pi::scan_search_text(&path),
+                SessionAgent::Hermes => hermes::scan_search_text_for_session(&id),
             };
             (id, text)
         })
@@ -1045,6 +1074,40 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
             }
             cmd.status()?
         }
+        (SessionAgent::Pi, SessionSource::Local) => {
+            if !std::path::Path::new(project_path).exists() {
+                println!(
+                    "{} Pi session {} (project dir missing, starting in home)",
+                    action, session.id
+                );
+            }
+
+            println!(
+                "{} Pi session {} in {}",
+                action, session.id, session.project_path
+            );
+
+            let cwd = if std::path::Path::new(project_path).exists() {
+                project_path.clone()
+            } else {
+                dirs::home_dir().unwrap_or_default().to_string_lossy().to_string()
+            };
+
+            let mut cmd = Command::new("pi");
+            cmd.current_dir(&cwd);
+            cmd.arg("--resume").arg(&session.id);
+            cmd.status()?
+        }
+        (SessionAgent::Hermes, SessionSource::Local) => {
+            println!(
+                "{} Hermes session {}",
+                action, session.id
+            );
+            Command::new("hermes")
+                .arg("--resume")
+                .arg(&session.id)
+                .status()?
+        }
         (SessionAgent::Claude, SessionSource::Remote { name, host, user }) => {
             let ssh_target = match user {
                 Some(u) => format!("{}@{}", u, host),
@@ -1069,6 +1132,9 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
             Command::new("ssh")
                 .args(["-t", &ssh_target, &claude_cmd])
                 .status()?
+        }
+        (SessionAgent::Pi, _) | (SessionAgent::Hermes, _) => {
+            anyhow::bail!("{} sessions from non-local sources are not supported", session.agent.display_name())
         }
     };
 
@@ -1569,14 +1635,34 @@ fn interactive_mode(
                 header_lines.insert(0, Line::styled(txt, Style::default().fg(Color::Cyan)));
             }
             let mut filter_spans = Vec::new();
-            if !storage_view.is_live() {
+            // View tabs
+            let views = [SessionStorage::Live, SessionStorage::Archive, SessionStorage::Trash];
+            let view_labels = ["Live", "Done", "Archive", "Trash"];
+            for (i, &view) in views.iter().enumerate() {
+                let is_active = storage_view == view;
+                let label = if is_active {
+                    format!("[{}]", view_labels[i])
+                } else {
+                    format!(" {} ", view_labels[i])
+                };
                 filter_spans.push(Span::styled(
-                    format!("[{}] ", storage_view.display_name()),
+                    label,
                     Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
+                        .fg(if is_active { Color::Cyan } else { Color::DarkGray })
+                        .add_modifier(if is_active { Modifier::BOLD } else { Modifier::empty() }),
+                ));
+                filter_spans.push(Span::styled(
+                    if is_active { " " } else { "|" },
+                    Style::default().fg(Color::DarkGray),
                 ));
             }
+            // Done view (filtered live)
+            let done_label = " Done ";
+            filter_spans.push(Span::styled(
+                format!("[{}]", done_label.trim()),
+                Style::default().fg(Color::DarkGray),
+            ));
+            filter_spans.push(Span::styled(" ", Style::default().fg(Color::DarkGray)));
             filter_spans.push(Span::styled(
                 format!("[{}] filter> ", sort_label),
                 Style::default()
@@ -1800,6 +1886,60 @@ fn interactive_mode(
                     (KeyCode::Char('C'), _) if filter_text.is_empty() => {
                         new_codex = true;
                         break 'outer;
+                    }
+                    (KeyCode::Char('1'), _) if filter_text.is_empty() && storage_view != SessionStorage::Live => {
+                        if let Ok((new_sessions, _)) = reload(SessionStorage::Live) {
+                            storage_view = SessionStorage::Live;
+                            sessions = new_sessions;
+                            selected = 0;
+                            preview_scroll = 0;
+                            filter_text.clear();
+                            state = InteractiveState::default();
+                            let targets: Vec<(String, SessionAgent, PathBuf)> = sessions
+                                .iter()
+                                .map(|s| (s.id.clone(), s.agent, s.filepath.clone()))
+                                .collect();
+                            index_handle = Some(std::thread::spawn(move || {
+                                build_search_index_for_sessions(targets)
+                            }));
+                            search_index = None;
+                        }
+                    }
+                    (KeyCode::Char('3'), _) if filter_text.is_empty() && storage_view != SessionStorage::Archive => {
+                        if let Ok((new_sessions, _)) = reload(SessionStorage::Archive) {
+                            storage_view = SessionStorage::Archive;
+                            sessions = new_sessions;
+                            selected = 0;
+                            preview_scroll = 0;
+                            filter_text.clear();
+                            state = InteractiveState::default();
+                            let targets: Vec<(String, SessionAgent, PathBuf)> = sessions
+                                .iter()
+                                .map(|s| (s.id.clone(), s.agent, s.filepath.clone()))
+                                .collect();
+                            index_handle = Some(std::thread::spawn(move || {
+                                build_search_index_for_sessions(targets)
+                            }));
+                            search_index = None;
+                        }
+                    }
+                    (KeyCode::Char('4'), _) if filter_text.is_empty() && storage_view != SessionStorage::Trash => {
+                        if let Ok((new_sessions, _)) = reload(SessionStorage::Trash) {
+                            storage_view = SessionStorage::Trash;
+                            sessions = new_sessions;
+                            selected = 0;
+                            preview_scroll = 0;
+                            filter_text.clear();
+                            state = InteractiveState::default();
+                            let targets: Vec<(String, SessionAgent, PathBuf)> = sessions
+                                .iter()
+                                .map(|s| (s.id.clone(), s.agent, s.filepath.clone()))
+                                .collect();
+                            index_handle = Some(std::thread::spawn(move || {
+                                build_search_index_for_sessions(targets)
+                            }));
+                            search_index = None;
+                        }
                     }
                     (KeyCode::Char('v'), _) if filter_text.is_empty() => {
                         let next = match storage_view {

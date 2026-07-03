@@ -6,6 +6,8 @@ use std::time::SystemTime;
 pub enum SessionAgent {
     Claude,
     Codex,
+    Pi,
+    Hermes,
 }
 
 impl SessionAgent {
@@ -13,11 +15,17 @@ impl SessionAgent {
         match self {
             SessionAgent::Claude => "claude",
             SessionAgent::Codex => "codex",
+            SessionAgent::Pi => "pi",
+            SessionAgent::Hermes => "hermes",
         }
     }
 
     pub fn storage_dir(self) -> &'static str {
-        self.display_name()
+        match self {
+            SessionAgent::Pi => "pi",
+            SessionAgent::Hermes => "hermes",
+            _ => self.display_name(),
+        }
     }
 }
 

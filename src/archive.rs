@@ -27,7 +27,7 @@ pub fn find_sessions(storage: SessionStorage, agent: Option<SessionAgent>) -> Re
     }
 
     let mut sessions = Vec::new();
-    for agent_kind in [SessionAgent::Claude, SessionAgent::Codex] {
+    for agent_kind in [SessionAgent::Claude, SessionAgent::Codex, SessionAgent::Pi] {
         if agent.is_some_and(|a| a != agent_kind) {
             continue;
         }
@@ -53,6 +53,8 @@ pub fn find_sessions(storage: SessionStorage, agent: Option<SessionAgent>) -> Re
                     storage,
                 ),
                 SessionAgent::Codex => crate::codex::parse_session_file(path.to_path_buf(), storage),
+                SessionAgent::Pi => crate::pi::parse_session_file(path.to_path_buf(), storage),
+                SessionAgent::Hermes => None,
             };
             if let Some(session) = parsed {
                 sessions.push(session);
