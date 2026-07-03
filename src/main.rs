@@ -4,6 +4,7 @@ mod codex;
 mod interactive_state;
 mod message_classification;
 mod metadata;
+mod profile;
 mod remote;
 mod session;
 
@@ -14,6 +15,9 @@ use session::{Session, SessionAgent, SessionSource, SessionStorage};
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::SystemTime;
+
+const CODEX_CMD: &str = "codex-patched";
+const CODEX_YOLO_ARG: &str = "--yolo";
 
 // =============================================================================
 // CLI Interface
@@ -109,6 +113,21 @@ struct Args {
     strict: bool,
 
     // -------------------------------------------------------------------------
+    // Profiles (cc-multiplexor accounts)
+    // -------------------------------------------------------------------------
+    /// Print each profile's remaining usage limits and exit
+    #[arg(long, help_heading = "Profiles")]
+    usage: bool,
+
+    /// Auto-select the most-headroom profile and start a new Claude session
+    #[arg(long, help_heading = "Profiles")]
+    auto: bool,
+
+    /// Register/login a new profile by name, then exit
+    #[arg(long, value_name = "NAME", help_heading = "Profiles")]
+    login: Option<String>,
+
+    // -------------------------------------------------------------------------
     // Internal (hidden from --help)
     // -------------------------------------------------------------------------
     /// Preview a session file (used internally by interactive picker)
@@ -152,6 +171,17 @@ fn main() -> Result<()> {
     if let Some(ref filepath) = args.preview {
         print_session_preview(filepath)?;
         return Ok(());
+    }
+
+    // Profile commands: independent of session discovery, handle and exit.
+    if args.usage {
+        return profile::cmd_usage();
+    }
+    if let Some(name) = args.login.as_deref() {
+        return profile::cmd_login(name);
+    }
+    if args.auto {
+        return profile::cmd_auto();
     }
 
     // Load remote config
@@ -215,67 +245,72 @@ fn main() -> Result<()> {
         SessionStorage::Live
     };
 
-    let mut discovery_failures = 0;
-    let mut sessions = if storage_view.is_live() {
-        // Find sessions from all live sources.
-        let mut sessions = Vec::new();
+    // Load + filter sessions for a given storage view. Reused by the TUI to
+    // switch live/archive/trash without re-launching.
+    let load_view = |storage: SessionStorage| -> Result<(Vec<Session>, usize)> {
+        let mut discovery_failures = 0usize;
+        let mut sessions = if storage.is_live() {
+            let mut sessions = Vec::new();
 
-        if args.agent.includes(SessionAgent::Claude) {
-            let discovery =
-                claude_code::find_all_sessions_with_summary(&config, args.remote.as_deref())?;
-            for failure in &discovery.failures {
-                eprintln!(
-                    "Warning: Failed to load sessions from '{}': {}",
-                    failure.source_name, failure.reason
-                );
+            if args.agent.includes(SessionAgent::Claude) {
+                let discovery =
+                    claude_code::find_all_sessions_with_summary(&config, args.remote.as_deref())?;
+                for failure in &discovery.failures {
+                    eprintln!(
+                        "Warning: Failed to load sessions from '{}': {}",
+                        failure.source_name, failure.reason
+                    );
+                }
+                discovery_failures += discovery.failure_count();
+                sessions.extend(discovery.sessions);
             }
-            discovery_failures += discovery.failure_count();
-            sessions.extend(discovery.sessions);
+
+            if args.agent.includes(SessionAgent::Codex) && args.remote.is_none() {
+                sessions.extend(codex::find_sessions()?);
+            }
+
+            sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+            sessions
+        } else {
+            archive::find_sessions(storage, args.agent.as_agent())?
+        };
+
+        if let Some(ref filter) = args.project {
+            let filter_lower = filter.to_lowercase();
+            sessions.retain(|s| s.project.to_lowercase().contains(&filter_lower));
         }
 
-        if args.agent.includes(SessionAgent::Codex) && args.remote.is_none() {
-            sessions.extend(codex::find_sessions()?);
+        if let Some(min) = args.min_turns {
+            sessions.retain(|s| s.turn_count >= min);
         }
 
-        sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
-        sessions
-    } else {
-        archive::find_sessions(storage_view, args.agent.as_agent())?
+        if let Some(ref status_filter) = args.status {
+            let meta_store = metadata::load();
+            let filter_lower = status_filter.to_lowercase();
+            sessions.retain(|s| {
+                let status = metadata::get_status(&meta_store, &s.id);
+                match filter_lower.as_str() {
+                    "active" => status == Some(metadata::Status::Active),
+                    "paused" => status == Some(metadata::Status::Paused),
+                    "done" => status == Some(metadata::Status::Done),
+                    "none" => status.is_none(),
+                    _ => true,
+                }
+            });
+        } else if !args.include_done && storage.is_live() {
+            let meta_store = metadata::load();
+            sessions.retain(|s| {
+                metadata::get_status(&meta_store, &s.id) != Some(metadata::Status::Done)
+            });
+        }
+
+        Ok((sessions, discovery_failures))
     };
 
+    let (sessions, discovery_failures) = load_view(storage_view)?;
     enforce_strict_mode(args.strict, sync_failures, discovery_failures)?;
 
-    // Filter by project name if specified
-    if let Some(ref filter) = args.project {
-        let filter_lower = filter.to_lowercase();
-        sessions.retain(|s| s.project.to_lowercase().contains(&filter_lower));
-    }
-
-    // Filter by minimum turns (excludes one-shot sessions)
-    if let Some(min) = args.min_turns {
-        sessions.retain(|s| s.turn_count >= min);
-    }
-
-    // Filter by status
-    if let Some(ref status_filter) = args.status {
-        let meta_store = metadata::load();
-        let filter_lower = status_filter.to_lowercase();
-        sessions.retain(|s| {
-            let status = metadata::get_status(&meta_store, &s.id);
-            match filter_lower.as_str() {
-                "active" => status == Some(metadata::Status::Active),
-                "paused" => status == Some(metadata::Status::Paused),
-                "done" => status == Some(metadata::Status::Done),
-                "none" => status.is_none(),
-                _ => true,
-            }
-        });
-    } else if !args.include_done && storage_view.is_live() {
-        let meta_store = metadata::load();
-        sessions
-            .retain(|s| metadata::get_status(&meta_store, &s.id) != Some(metadata::Status::Done));
-    }
-
+    // Empty initial view bails (the TUI can still switch views once inside).
     if sessions.is_empty() {
         if args.project.is_some() {
             anyhow::bail!("No sessions found matching project filter");
@@ -290,7 +325,7 @@ fn main() -> Result<()> {
         let list_sessions = filter_forks_for_list(&sessions, args.include_forks);
         print_sessions(&list_sessions, args.count, args.debug);
     } else {
-        interactive_mode(sessions, args.fork, args.debug)?;
+        interactive_mode(sessions, storage_view, &load_view, args.fork, args.debug)?;
     }
 
     Ok(())
@@ -950,7 +985,7 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
                 action, session.id, session.project_path
             );
 
-            let mut cmd = Command::new("codex");
+            let mut cmd = Command::new(CODEX_CMD);
             cmd.current_dir(project_path);
             if fork {
                 cmd.args(["fork", &session.id]);
@@ -958,13 +993,17 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
                 cmd.args(["resume", &session.id]);
             }
             // Mirror Claude's bypassPermissions: open Codex in yolo mode.
-            cmd.arg("--dangerously-bypass-approvals-and-sandbox");
+            cmd.arg(CODEX_YOLO_ARG);
             cmd.status()?
         }
         (SessionAgent::Codex, SessionSource::Remote { .. }) => {
             anyhow::bail!("Remote Codex sessions are not supported yet")
         }
-        (SessionAgent::Claude, SessionSource::Local) => {
+        (SessionAgent::Codex, SessionSource::Profile { .. }) => {
+            anyhow::bail!("Codex sessions do not use Claude profiles")
+        }
+        (SessionAgent::Claude, SessionSource::Local)
+        | (SessionAgent::Claude, SessionSource::Profile { .. }) => {
             // Verify directory exists locally
             if !std::path::Path::new(project_path).exists() {
                 eprintln!(
@@ -975,10 +1014,16 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
                 anyhow::bail!("Cannot resume: directory '{}' not found", project_path);
             }
 
-            println!(
-                "{} session {} in {}",
-                action, session.id, session.project_path
-            );
+            match &session.source {
+                SessionSource::Profile { name, .. } => println!(
+                    "{} session {} in {} (profile {})",
+                    action, session.id, session.project_path, name
+                ),
+                _ => println!(
+                    "{} session {} in {}",
+                    action, session.id, session.project_path
+                ),
+            }
 
             // On Windows, claude is installed as .cmd — use cmd.exe to resolve it.
             // On Unix, invoke directly.
@@ -991,6 +1036,10 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
             };
             cmd.current_dir(project_path)
                 .args(["-r", &session.id, "--permission-mode", "bypassPermissions"]);
+            // Reopen under the profile's account by pointing Claude at its config dir.
+            if let SessionSource::Profile { config_dir, .. } = &session.source {
+                cmd.env("CLAUDE_CONFIG_DIR", config_dir);
+            }
             if fork {
                 cmd.arg("--fork-session");
             }
@@ -1029,6 +1078,21 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
         eprintln!("Session file: {}", filepath.display());
     }
 
+    Ok(())
+}
+
+/// Start a new Codex session in yolo mode (no approvals/sandbox), mirroring the
+/// Codex resume path. Runs in the current working directory.
+fn launch_codex_new() -> Result<()> {
+    use std::process::Command;
+    println!("Starting new Codex session (yolo)");
+    let status = Command::new(CODEX_CMD)
+        .arg(CODEX_YOLO_ARG)
+        .status()
+        .with_context(|| format!("failed to launch {CODEX_CMD}"))?;
+    if !status.success() {
+        eprintln!("{CODEX_CMD} exited with code {}", status.code().unwrap_or(-1));
+    }
     Ok(())
 }
 
@@ -1280,7 +1344,13 @@ fn parse_ansi_text(input: &str) -> ratatui::text::Text<'static> {
 // Interactive Mode (ratatui + crossterm TUI)
 // =============================================================================
 
-fn interactive_mode(mut sessions: Vec<Session>, fork: bool, debug: bool) -> Result<()> {
+fn interactive_mode(
+    mut sessions: Vec<Session>,
+    mut storage_view: SessionStorage,
+    reload: impl Fn(SessionStorage) -> Result<(Vec<Session>, usize)>,
+    fork: bool,
+    debug: bool,
+) -> Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
     use ratatui::backend::CrosstermBackend;
@@ -1324,10 +1394,23 @@ fn interactive_mode(mut sessions: Vec<Session>, fork: bool, debug: bool) -> Resu
     let mut selected_session_id: Option<String> = None;
     let mut meta_store = metadata::load();
 
+    // Profile usage: query in the background (like the search index) so the
+    // picker stays responsive; results fill the header line when they arrive.
+    let known_profiles = profile::profiles();
+    let has_profiles = !known_profiles.is_empty();
+    let mut usage_handle = if has_profiles {
+        Some(std::thread::spawn(profile::query_all))
+    } else {
+        None
+    };
+    let mut usages: Option<Vec<(profile::Profile, Result<profile::Usage>)>> = None;
+    let mut auto_launch = false;
+    let mut new_codex = false;
+
     'outer: loop {
-        if sessions.is_empty() {
-            selected_session_id = None;
-            break 'outer;
+        // Pick up background usage results when ready (non-blocking).
+        if usages.is_none() && usage_handle.as_ref().is_some_and(|h| h.is_finished()) {
+            usages = usage_handle.take().and_then(|h| h.join().ok());
         }
 
         let session_by_id: HashMap<&str, &Session> =
@@ -1459,7 +1542,10 @@ fn interactive_mode(mut sessions: Vec<Session>, fork: bool, debug: bool) -> Resu
             // Left: header + filter + list
             let v_split = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Min(1)])
+                .constraints([
+                    Constraint::Length(if has_profiles { 4 } else { 3 }),
+                    Constraint::Min(1),
+                ])
                 .split(h_split[0]);
 
             // Header + filter input
@@ -1467,16 +1553,39 @@ fn interactive_mode(mut sessions: Vec<Session>, fork: bool, debug: bool) -> Resu
                 .lines()
                 .map(|l| Line::styled(l.to_string(), Style::default().fg(Color::DarkGray)))
                 .collect();
-            header_lines.push(Line::from(vec![
-                Span::styled(
-                    format!("[{}] filter> ", sort_label),
+            // Profile usage line on top (most-headroom marked ★).
+            if has_profiles {
+                let txt = match &usages {
+                    Some(r) => format!("{}   A=새 세션 · C=codex", profile::summary_line(r)),
+                    None => format!(
+                        "프로필 조회 중… ({})",
+                        known_profiles
+                            .iter()
+                            .map(|p| p.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                };
+                header_lines.insert(0, Line::styled(txt, Style::default().fg(Color::Cyan)));
+            }
+            let mut filter_spans = Vec::new();
+            if !storage_view.is_live() {
+                filter_spans.push(Span::styled(
+                    format!("[{}] ", storage_view.display_name()),
                     Style::default()
-                        .fg(Color::Green)
+                        .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(filter_text.clone()),
-                Span::styled("█", Style::default().fg(Color::White)),
-            ]));
+                ));
+            }
+            filter_spans.push(Span::styled(
+                format!("[{}] filter> ", sort_label),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            filter_spans.push(Span::raw(filter_text.clone()));
+            filter_spans.push(Span::styled("█", Style::default().fg(Color::White)));
+            header_lines.push(Line::from(filter_spans));
             f.render_widget(Paragraph::new(header_lines), v_split[0]);
 
             // Session list
@@ -1684,6 +1793,38 @@ fn interactive_mode(mut sessions: Vec<Session>, fork: bool, debug: bool) -> Resu
                         selected = 0;
                         preview_scroll = 0;
                     }
+                    (KeyCode::Char('A'), _) if has_profiles && filter_text.is_empty() => {
+                        auto_launch = true;
+                        break 'outer;
+                    }
+                    (KeyCode::Char('C'), _) if filter_text.is_empty() => {
+                        new_codex = true;
+                        break 'outer;
+                    }
+                    (KeyCode::Char('v'), _) if filter_text.is_empty() => {
+                        let next = match storage_view {
+                            SessionStorage::Live => SessionStorage::Archive,
+                            SessionStorage::Archive => SessionStorage::Trash,
+                            SessionStorage::Trash => SessionStorage::Live,
+                        };
+                        if let Ok((new_sessions, _)) = reload(next) {
+                            storage_view = next;
+                            sessions = new_sessions;
+                            selected = 0;
+                            preview_scroll = 0;
+                            filter_text.clear();
+                            state = InteractiveState::default();
+                            // Rebuild the search index for the new session set.
+                            let targets: Vec<(String, SessionAgent, PathBuf)> = sessions
+                                .iter()
+                                .map(|s| (s.id.clone(), s.agent, s.filepath.clone()))
+                                .collect();
+                            index_handle = Some(std::thread::spawn(move || {
+                                build_search_index_for_sessions(targets)
+                            }));
+                            search_index = None;
+                        }
+                    }
                     (KeyCode::PageDown, _) => {
                         preview_scroll = preview_scroll.saturating_add(10);
                     }
@@ -1711,8 +1852,16 @@ fn interactive_mode(mut sessions: Vec<Session>, fork: bool, debug: bool) -> Resu
     crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     let _ = std::panic::take_hook();
 
-    // Resume selected session
-    if let Some(session_id) = selected_session_id
+    // Auto-launch the most-headroom profile, or resume the selected session.
+    if auto_launch {
+        let results = usages
+            .take()
+            .or_else(|| usage_handle.take().and_then(|h| h.join().ok()))
+            .unwrap_or_default();
+        profile::launch_best(&results)?;
+    } else if new_codex {
+        launch_codex_new()?;
+    } else if let Some(session_id) = selected_session_id
         && let Some(session) = sessions.iter().find(|s| s.id == session_id)
     {
         resume_session(session, &session.filepath, fork)?;

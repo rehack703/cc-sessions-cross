@@ -48,6 +48,15 @@ impl SessionStorage {
 pub enum SessionSource {
     /// Local session from ~/.claude/projects
     Local,
+    /// Session from a cc-multiplexor profile (its own CLAUDE_CONFIG_DIR under
+    /// ~/.claude-profiles/<name>). Resumed with that config dir so the session
+    /// reopens under the right account.
+    Profile {
+        /// Profile name (e.g., "work", "personal")
+        name: String,
+        /// The profile's CLAUDE_CONFIG_DIR
+        config_dir: PathBuf,
+    },
     /// Remote session synced via SSH
     Remote {
         /// Config key (e.g., "devbox")
@@ -64,6 +73,7 @@ impl SessionSource {
     pub fn display_name(&self) -> &str {
         match self {
             SessionSource::Local => "local",
+            SessionSource::Profile { name, .. } => name,
             SessionSource::Remote { name, .. } => name,
         }
     }

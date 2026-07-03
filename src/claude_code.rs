@@ -61,6 +61,46 @@ pub fn get_claude_projects_dir() -> Result<PathBuf> {
     Ok(home.join(".claude").join("projects"))
 }
 
+/// Base directory holding cc-multiplexor profile config dirs.
+///
+/// Mirrors ccm's own resolution: `$CCM_HOME`, else `~/.claude-profiles`.
+pub fn get_ccm_home() -> Option<PathBuf> {
+    match std::env::var("CCM_HOME") {
+        Ok(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+        _ => dirs::home_dir().map(|h| h.join(".claude-profiles")),
+    }
+}
+
+/// Discover cc-multiplexor profiles as `(name, config_dir)` pairs.
+///
+/// Each subdirectory of `CCM_HOME` is a profile whose path is its
+/// `CLAUDE_CONFIG_DIR`. Skips ccm's own `.ccm` state dir. Returns an empty
+/// list when no profiles exist (i.e. ccm is not in use).
+pub fn find_profiles() -> Vec<(String, PathBuf)> {
+    match get_ccm_home() {
+        Some(home) => read_profiles_in(&home),
+        None => Vec::new(),
+    }
+}
+
+/// Read profile `(name, config_dir)` pairs from a CCM_HOME directory, sorted by
+/// name and skipping ccm's `.ccm` state dir. Empty when the dir is absent.
+fn read_profiles_in(home: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = fs::read_dir(home) else {
+        return Vec::new();
+    };
+    let mut profiles: Vec<(String, PathBuf)> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.to_string();
+            (name != ".ccm").then_some((name, e.path()))
+        })
+        .collect();
+    profiles.sort_by(|a, b| a.0.cmp(&b.0));
+    profiles
+}
+
 /// Check if a source should be included based on the filter.
 fn should_include_source(remote_filter: Option<&str>, source_name: &str) -> bool {
     match remote_filter {
@@ -85,6 +125,31 @@ pub fn find_all_sessions_with_summary(
             summary
                 .sessions
                 .extend(find_sessions_with_source(&local_dir, SessionSource::Local)?);
+        }
+    }
+
+    // Load cc-multiplexor profile sessions (each profile dir is its own
+    // CLAUDE_CONFIG_DIR). A "local" filter means the default config dir only.
+    if remote_filter != Some("local") {
+        for (name, config_dir) in find_profiles() {
+            if !should_include_source(remote_filter, &name) {
+                continue;
+            }
+            let projects_dir = config_dir.join("projects");
+            if !projects_dir.exists() {
+                continue;
+            }
+            let source = SessionSource::Profile {
+                name: name.clone(),
+                config_dir,
+            };
+            match find_sessions_with_source(&projects_dir, source) {
+                Ok(sessions) => summary.sessions.extend(sessions),
+                Err(e) => summary.failures.push(DiscoveryFailure {
+                    source_name: name,
+                    reason: e.to_string(),
+                }),
+            }
         }
     }
 
@@ -205,7 +270,9 @@ pub fn parse_session_file(
     // Birthtime is meaningless for rsynced cache copies (it's when the local
     // file was written, not when the remote session began). Fall back to mtime.
     let created = match source {
-        SessionSource::Local => metadata.created().unwrap_or(modified),
+        SessionSource::Local | SessionSource::Profile { .. } => {
+            metadata.created().unwrap_or(modified)
+        }
         SessionSource::Remote { .. } => modified,
     };
 
@@ -298,10 +365,12 @@ fn scan_session_file(filepath: &Path) -> SessionScan {
         };
 
         // Sidechain (subagent) and teammate (swarm) sessions can both land in
-        // the main project dir as UUID-named files. Bail early — they can be
-        // large and we're discarding them anyway.
+        // the main project dir as UUID-named files. One-shot `claude -p` command
+        // sessions (entrypoint "sdk-cli") are likewise noise in the picker. Bail
+        // early — they can be large and we're discarding them anyway.
         if entry.get("isSidechain").and_then(|v| v.as_bool()) == Some(true)
             || entry.get("teamName").and_then(|v| v.as_str()).is_some()
+            || entry.get("entrypoint").and_then(|v| v.as_str()) == Some("sdk-cli")
         {
             scan.skip = true;
             return scan;
@@ -590,6 +659,28 @@ fn strip_user_prefix(dir: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn read_profiles_lists_dirs_sorted_and_skips_ccm() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        for name in ["work", "personal", ".ccm"] {
+            fs::create_dir(root.join(name)).unwrap();
+        }
+        // A stray file (not a directory) must be ignored.
+        fs::write(root.join("notes.txt"), "x").unwrap();
+
+        let profiles = read_profiles_in(root);
+        let names: Vec<&str> = profiles.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["personal", "work"]);
+        assert!(profiles.iter().all(|(_, p)| p.is_dir()));
+    }
+
+    #[test]
+    fn read_profiles_empty_when_dir_missing() {
+        let tmp = TempDir::new().unwrap();
+        assert!(read_profiles_in(&tmp.path().join("nope")).is_empty());
+    }
 
     /// Write JSONL content to a tempfile and return (guard, path).
     /// The TempDir guard cleans up on drop — no manual remove_dir_all needed.
@@ -964,6 +1055,23 @@ mod tests {
     fn count_turns_empty_file() {
         let (_tmp, path) = scan_fixture("");
         assert_eq!(scan(&path).turn_count, 0);
+    }
+
+    #[test]
+    fn scan_filters_command_sessions() {
+        // `claude -p` one-shot sessions are tagged entrypoint "sdk-cli".
+        let (_tmp, path) = scan_fixture(
+            r#"{"type":"user","entrypoint":"sdk-cli","message":{"role":"user","content":"hi"},"cwd":"/x"}"#,
+        );
+        assert!(scan(&path).skip);
+    }
+
+    #[test]
+    fn scan_keeps_interactive_sessions() {
+        let (_tmp, path) = scan_fixture(
+            r#"{"type":"user","entrypoint":"cli","message":{"role":"user","content":"hi"},"cwd":"/x"}"#,
+        );
+        assert!(!scan(&path).skip);
     }
 
     #[test]
