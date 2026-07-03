@@ -275,9 +275,10 @@ pub fn generate_preview_content(filepath: &Path) -> Result<String> {
                 output.push_str(prefix);
 
                 if let Some(text) = content.and_then(|c| extract_text_content(c)) {
-                    // Truncate very long tool results
+                    // Truncate very long tool results (char-safe)
                     if role == "toolResult" && text.len() > 500 {
-                        output.push_str(&text[..500]);
+                        let truncated: String = text.chars().take(500).collect();
+                        output.push_str(&truncated);
                         output.push_str("...");
                     } else {
                         output.push_str(&text);

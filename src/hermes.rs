@@ -202,7 +202,8 @@ pub fn generate_preview_for_session_id(session_id: &str) -> Result<String> {
         output.push_str(prefix);
         if role == "tool" || role == "toolResult" {
             if content.len() > 300 {
-                output.push_str(&content[..300]);
+                let truncated: String = content.chars().take(300).collect();
+                output.push_str(&truncated);
                 output.push_str("...");
             } else {
                 output.push_str(&content);
