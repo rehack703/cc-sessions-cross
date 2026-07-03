@@ -1162,6 +1162,31 @@ fn launch_codex_new() -> Result<()> {
     Ok(())
 }
 
+fn launch_pi_new() -> Result<()> {
+    use std::process::Command;
+    println!("Starting new Pi session");
+    let status = Command::new("pi")
+        .status()
+        .context("failed to launch pi")?;
+    if !status.success() {
+        eprintln!("pi exited with code {}", status.code().unwrap_or(-1));
+    }
+    Ok(())
+}
+
+fn launch_hermes_new() -> Result<()> {
+    use std::process::Command;
+    println!("Starting new Hermes session");
+    let status = Command::new("hermes")
+        .arg("chat")
+        .status()
+        .context("failed to launch hermes")?;
+    if !status.success() {
+        eprintln!("hermes exited with code {}", status.code().unwrap_or(-1));
+    }
+    Ok(())
+}
+
 // =============================================================================
 // Interactive Mode (skim - no external dependencies)
 // =============================================================================
@@ -1406,6 +1431,22 @@ fn parse_ansi_text(input: &str) -> ratatui::text::Text<'static> {
     ratatui::text::Text::from(lines)
 }
 
+/// Rebuild the search index after a view switch.
+fn rebuild_index(
+    sessions: &[Session],
+    index_handle: &mut Option<std::thread::JoinHandle<claude_code::SearchIndex>>,
+    search_index: &mut Option<claude_code::SearchIndex>,
+) {
+    let targets: Vec<(String, SessionAgent, PathBuf)> = sessions
+        .iter()
+        .map(|s| (s.id.clone(), s.agent, s.filepath.clone()))
+        .collect();
+    *index_handle = Some(std::thread::spawn(move || {
+        build_search_index_for_sessions(targets)
+    }));
+    *search_index = None;
+}
+
 // =============================================================================
 // Interactive Mode (ratatui + crossterm TUI)
 // =============================================================================
@@ -1472,6 +1513,9 @@ fn interactive_mode(
     let mut usages: Option<Vec<(profile::Profile, Result<profile::Usage>)>> = None;
     let mut auto_launch = false;
     let mut new_codex = false;
+    let mut new_pi = false;
+    let mut new_hermes = false;
+    let mut done_view = false;
 
     'outer: loop {
         // Pick up background usage results when ready (non-blocking).
@@ -1622,9 +1666,9 @@ fn interactive_mode(
             // Profile usage line on top (most-headroom marked ★).
             if has_profiles {
                 let txt = match &usages {
-                    Some(r) => format!("{}   A=새 세션 · C=codex", profile::summary_line(r)),
+                    Some(r) => format!("{}   A=새 세션 · C=codex · P=pi · H=hermes", profile::summary_line(r)),
                     None => format!(
-                        "프로필 조회 중… ({})",
+                        "프로필 조회 중… ({}) · P=pi · H=hermes",
                         known_profiles
                             .iter()
                             .map(|p| p.name.as_str())
@@ -1636,17 +1680,20 @@ fn interactive_mode(
             }
             let mut filter_spans = Vec::new();
             // View tabs
-            let views = [SessionStorage::Live, SessionStorage::Archive, SessionStorage::Trash];
-            let view_labels = ["Live", "Done", "Archive", "Trash"];
-            for (i, &view) in views.iter().enumerate() {
-                let is_active = storage_view == view;
-                let label = if is_active {
-                    format!("[{}]", view_labels[i])
+            let tabs = [
+                ("1", "Live", !done_view && storage_view == SessionStorage::Live),
+                ("2", "Done", done_view),
+                ("3", "Archive", !done_view && storage_view == SessionStorage::Archive),
+                ("4", "Trash", !done_view && storage_view == SessionStorage::Trash),
+            ];
+            for &(key, label, is_active) in &tabs {
+                let display = if is_active {
+                    format!("[{}:{}]", key, label)
                 } else {
-                    format!(" {} ", view_labels[i])
+                    format!(" {}:{} ", key, label)
                 };
                 filter_spans.push(Span::styled(
-                    label,
+                    display,
                     Style::default()
                         .fg(if is_active { Color::Cyan } else { Color::DarkGray })
                         .add_modifier(if is_active { Modifier::BOLD } else { Modifier::empty() }),
@@ -1656,13 +1703,6 @@ fn interactive_mode(
                     Style::default().fg(Color::DarkGray),
                 ));
             }
-            // Done view (filtered live)
-            let done_label = " Done ";
-            filter_spans.push(Span::styled(
-                format!("[{}]", done_label.trim()),
-                Style::default().fg(Color::DarkGray),
-            ));
-            filter_spans.push(Span::styled(" ", Style::default().fg(Color::DarkGray)));
             filter_spans.push(Span::styled(
                 format!("[{}] filter> ", sort_label),
                 Style::default()
@@ -1887,7 +1927,45 @@ fn interactive_mode(
                         new_codex = true;
                         break 'outer;
                     }
+                    (KeyCode::Char('P'), _) if filter_text.is_empty() => {
+                        new_pi = true;
+                        break 'outer;
+                    }
+                    (KeyCode::Char('H'), _) if filter_text.is_empty() => {
+                        new_hermes = true;
+                        break 'outer;
+                    }
+                    (KeyCode::Char('2'), _) if filter_text.is_empty() => {
+                        // Done view (toggle): show only done-marked sessions
+                        if done_view {
+                            done_view = false;
+                            if let Ok((new_sessions, _)) = reload(SessionStorage::Live) {
+                                storage_view = SessionStorage::Live;
+                                sessions = new_sessions;
+                                selected = 0;
+                                preview_scroll = 0;
+                                filter_text.clear();
+                                state = InteractiveState::default();
+                                rebuild_index(&sessions, &mut index_handle, &mut search_index);
+                            }
+                        } else {
+                            done_view = true;
+                            if let Ok((new_sessions, _)) = reload(SessionStorage::Live) {
+                                storage_view = SessionStorage::Live;
+                                let meta_store = metadata::load();
+                                sessions = new_sessions.into_iter()
+                                    .filter(|s| metadata::get_status(&meta_store, &s.id) == Some(metadata::Status::Done))
+                                    .collect();
+                                selected = 0;
+                                preview_scroll = 0;
+                                filter_text.clear();
+                                state = InteractiveState::default();
+                                rebuild_index(&sessions, &mut index_handle, &mut search_index);
+                            }
+                        }
+                    }
                     (KeyCode::Char('1'), _) if filter_text.is_empty() && storage_view != SessionStorage::Live => {
+                        done_view = false;
                         if let Ok((new_sessions, _)) = reload(SessionStorage::Live) {
                             storage_view = SessionStorage::Live;
                             sessions = new_sessions;
@@ -1895,17 +1973,11 @@ fn interactive_mode(
                             preview_scroll = 0;
                             filter_text.clear();
                             state = InteractiveState::default();
-                            let targets: Vec<(String, SessionAgent, PathBuf)> = sessions
-                                .iter()
-                                .map(|s| (s.id.clone(), s.agent, s.filepath.clone()))
-                                .collect();
-                            index_handle = Some(std::thread::spawn(move || {
-                                build_search_index_for_sessions(targets)
-                            }));
-                            search_index = None;
+                            rebuild_index(&sessions, &mut index_handle, &mut search_index);
                         }
                     }
                     (KeyCode::Char('3'), _) if filter_text.is_empty() && storage_view != SessionStorage::Archive => {
+                        done_view = false;
                         if let Ok((new_sessions, _)) = reload(SessionStorage::Archive) {
                             storage_view = SessionStorage::Archive;
                             sessions = new_sessions;
@@ -1913,17 +1985,11 @@ fn interactive_mode(
                             preview_scroll = 0;
                             filter_text.clear();
                             state = InteractiveState::default();
-                            let targets: Vec<(String, SessionAgent, PathBuf)> = sessions
-                                .iter()
-                                .map(|s| (s.id.clone(), s.agent, s.filepath.clone()))
-                                .collect();
-                            index_handle = Some(std::thread::spawn(move || {
-                                build_search_index_for_sessions(targets)
-                            }));
-                            search_index = None;
+                            rebuild_index(&sessions, &mut index_handle, &mut search_index);
                         }
                     }
                     (KeyCode::Char('4'), _) if filter_text.is_empty() && storage_view != SessionStorage::Trash => {
+                        done_view = false;
                         if let Ok((new_sessions, _)) = reload(SessionStorage::Trash) {
                             storage_view = SessionStorage::Trash;
                             sessions = new_sessions;
@@ -1931,14 +1997,7 @@ fn interactive_mode(
                             preview_scroll = 0;
                             filter_text.clear();
                             state = InteractiveState::default();
-                            let targets: Vec<(String, SessionAgent, PathBuf)> = sessions
-                                .iter()
-                                .map(|s| (s.id.clone(), s.agent, s.filepath.clone()))
-                                .collect();
-                            index_handle = Some(std::thread::spawn(move || {
-                                build_search_index_for_sessions(targets)
-                            }));
-                            search_index = None;
+                            rebuild_index(&sessions, &mut index_handle, &mut search_index);
                         }
                     }
                     (KeyCode::Char('v'), _) if filter_text.is_empty() => {
@@ -1947,6 +2006,7 @@ fn interactive_mode(
                             SessionStorage::Archive => SessionStorage::Trash,
                             SessionStorage::Trash => SessionStorage::Live,
                         };
+                        done_view = false;
                         if let Ok((new_sessions, _)) = reload(next) {
                             storage_view = next;
                             sessions = new_sessions;
@@ -1954,15 +2014,7 @@ fn interactive_mode(
                             preview_scroll = 0;
                             filter_text.clear();
                             state = InteractiveState::default();
-                            // Rebuild the search index for the new session set.
-                            let targets: Vec<(String, SessionAgent, PathBuf)> = sessions
-                                .iter()
-                                .map(|s| (s.id.clone(), s.agent, s.filepath.clone()))
-                                .collect();
-                            index_handle = Some(std::thread::spawn(move || {
-                                build_search_index_for_sessions(targets)
-                            }));
-                            search_index = None;
+                            rebuild_index(&sessions, &mut index_handle, &mut search_index);
                         }
                     }
                     (KeyCode::PageDown, _) => {
@@ -2001,6 +2053,10 @@ fn interactive_mode(
         profile::launch_best(&results)?;
     } else if new_codex {
         launch_codex_new()?;
+    } else if new_pi {
+        launch_pi_new()?;
+    } else if new_hermes {
+        launch_hermes_new()?;
     } else if let Some(session_id) = selected_session_id
         && let Some(session) = sessions.iter().find(|s| s.id == session_id)
     {
